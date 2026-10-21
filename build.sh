@@ -1,0 +1,496 @@
+#!/bin/bash
+set -e
+
+# ==== Configuration ====
+MTX_VERSION="1.12.1"
+BUILD_DIR="build"
+GO_TEMP_DIR="$BUILD_DIR/go_viewer"
+MTX_BASE_URL="https://github.com/bluenviron/mediamtx/releases/download/v${MTX_VERSION}"
+VF_OUTPUT="$BUILD_DIR/vf"
+MTX_OUTPUT="$BUILD_DIR/mediamtx_bin"
+INSIGHT_BIN="neat_insight/bin"
+DIST_DIR="dist"
+
+INSTALL_WHEEL=0
+SKIP_FRONTEND=0
+SKIP_SHIM=0
+WHEEL_PLAT_NAME=""
+PACKAGE_VERSION=""
+TARGET_PLATFORM="host"
+
+usage() {
+    cat <<EOF
+Usage: ./build.sh [options]
+
+Options:
+  --release        Deprecated (no Docker installer artifacts are produced)
+  --install        Install built neat-insight wheel into active virtualenv
+  --skip-frontend  Skip npm frontend build step
+  --skip-shim      Skip the TCP_NODELAY shim; Linux wheels then run ffmpeg with Nagle enabled
+  --target-platform  Build target platform:
+                     host (default), all, linux-aarch64, linux-amd64, macos-arm64, windows-amd64
+  -h, --help       Show this help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --release)
+            echo "⚠️ --release is deprecated and has no additional effect."
+            ;;
+        --install)
+            INSTALL_WHEEL=1
+            ;;
+        --skip-frontend)
+            SKIP_FRONTEND=1
+            ;;
+        --skip-shim)
+            SKIP_SHIM=1
+            ;;
+        --target-platform)
+            TARGET_PLATFORM="${2:-}"
+            if [[ -z "$TARGET_PLATFORM" ]]; then
+                echo "❌ --target-platform requires a value."
+                usage
+                exit 1
+            fi
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "❌ Unknown option: $1"
+            usage
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+# ==== Helpers ====
+sanitize_pep440_local_part() {
+    local value="$1"
+    value=$(echo "$value" | tr '[:upper:]' '[:lower:]')
+    value=$(echo "$value" | sed -E 's/[^a-z0-9]+/./g; s/^\.//; s/\.$//; s/\.\.+/./g')
+    if [[ -z "$value" ]]; then
+        value="unknown"
+    fi
+    echo "$value"
+}
+
+
+resolve_package_version() {
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        PACKAGE_VERSION="0.0.0+unknown"
+        echo "📦 PACKAGE_VERSION set to $PACKAGE_VERSION (no git repo)"
+        return
+    fi
+
+    local tag
+    while IFS= read -r tag; do
+        if [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            PACKAGE_VERSION="${BASH_REMATCH[1]}"
+            echo "📦 PACKAGE_VERSION set to $PACKAGE_VERSION (from tag $tag)"
+            return
+        fi
+        if [[ "$tag" =~ ^([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            PACKAGE_VERSION="${BASH_REMATCH[1]}"
+            echo "📦 PACKAGE_VERSION set to $PACKAGE_VERSION (from tag $tag)"
+            return
+        fi
+    done < <(git tag --points-at HEAD)
+
+    local branch short_hash local_branch
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    short_hash=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    local_branch=$(sanitize_pep440_local_part "$branch")
+    PACKAGE_VERSION="0.0.0+${local_branch}.${short_hash}"
+    echo "📦 PACKAGE_VERSION set to $PACKAGE_VERSION (from branch/hash)"
+}
+
+
+build_frontend() {
+    if [[ "$SKIP_FRONTEND" == "1" ]]; then
+        echo "⏭️ Skipping frontend build (--skip-frontend)"
+        return
+    fi
+
+    if [[ ! -f frontend/package.json ]]; then
+        echo "❌ frontend/package.json not found."
+        exit 1
+    fi
+    if ! command -v npm >/dev/null 2>&1; then
+        echo "❌ npm not found. Install Node.js/npm or use --skip-frontend."
+        exit 1
+    fi
+
+    echo "🧱 Building frontend..."
+    pushd frontend > /dev/null
+    if [[ -f package-lock.json ]]; then
+        npm ci
+    else
+        npm install
+    fi
+    npm run build
+    npm run build:viewer
+    popd > /dev/null
+}
+
+
+install_wheel_into_venv() {
+    if [[ "$INSTALL_WHEEL" != "1" ]]; then
+        return
+    fi
+
+    if [[ -z "${VIRTUAL_ENV:-}" ]]; then
+        echo "❌ --install requested but no active virtualenv detected."
+        echo "   Activate your venv first (e.g. source .venv/bin/activate)."
+        exit 1
+    fi
+
+    local wheel
+    wheel=$(ls -t "$DIST_DIR"/neat_insight-*.whl 2>/dev/null | head -n 1 || true)
+    if [[ -z "$wheel" ]]; then
+        echo "❌ No neat-insight wheel found in $DIST_DIR/."
+        exit 1
+    fi
+
+    echo "📥 Installing wheel into virtualenv: $VIRTUAL_ENV"
+    python3 -m pip install --force-reinstall "$wheel"
+}
+
+
+resolve_go_archive() {
+    local version="$1"
+    local os_name="$2"
+    local arch_name="$3"
+
+    if [[ "$os_name" == "Linux" ]]; then
+        if [[ "$arch_name" == "x86_64" ]]; then
+            echo "go${version}.linux-amd64.tar.gz"
+            return 0
+        fi
+        if [[ "$arch_name" == "aarch64" || "$arch_name" == "arm64" ]]; then
+            echo "go${version}.linux-arm64.tar.gz"
+            return 0
+        fi
+        echo "❌ Unsupported Linux architecture: $arch_name" >&2
+        return 1
+    fi
+
+    if [[ "$os_name" == "Darwin" ]]; then
+        if [[ "$arch_name" == "arm64" ]]; then
+            echo "go${version}.darwin-arm64.tar.gz"
+            return 0
+        fi
+        echo "❌ Unsupported Darwin architecture: $arch_name" >&2
+        return 1
+    fi
+
+    echo "❌ Auto-install only supported on Linux and macOS for now. Please install Go manually." >&2
+    return 1
+}
+
+
+ensure_go() {
+    REQUIRED_VERSION="1.24.5"
+    GO_OK=0
+    if command -v go >/dev/null 2>&1; then
+        GO_VERSION=$(go version | awk '{print $3}' | sed 's/go//')
+        GO_MAJOR=$(echo "$GO_VERSION" | cut -d. -f1)
+        GO_MINOR=$(echo "$GO_VERSION" | cut -d. -f2)
+
+        if [[ "$GO_MAJOR" -gt 1 || ( "$GO_MAJOR" -eq 1 && "$GO_MINOR" -ge 24 ) ]]; then
+            echo "✅ Go version $GO_VERSION is installed."
+            GO_OK=1
+        else
+            echo "⚠️ Found Go $GO_VERSION, but 1.24 or newer is required."
+        fi
+    else
+        echo "⚠️ Go is not installed."
+    fi
+
+    if [[ $GO_OK -eq 0 ]]; then
+        read -p "👉 Do you want to install Go $REQUIRED_VERSION now? [y/N]: " INSTALL_GO
+        if [[ "$INSTALL_GO" =~ ^[Yy]$ ]]; then
+            install_go "$REQUIRED_VERSION"
+        else
+            echo "❌ Cannot proceed without Go 1.24+. Exiting."
+            exit 1
+        fi
+    fi
+}
+
+install_go() {
+    local version="$1"
+    local os_name
+    local arch_name
+    local go_tar
+
+    os_name=$(uname -s)
+    arch_name=$(uname -m)
+
+    go_tar=$(resolve_go_archive "$version" "$os_name" "$arch_name") || exit 1
+
+    echo "📦 Installing Go $version..."
+    curl -LO "https://go.dev/dl/${go_tar}"
+    mkdir -p ~/.local
+    tar -C ~/.local -xzf "$go_tar"
+    rm "$go_tar"
+    export PATH="$HOME/.local/go/bin:$PATH"
+
+    echo "✅ Go installed to ~/.local/go"
+    echo "👉 Please add the following to your shell profile:"
+    echo 'export PATH="$HOME/.local/go/bin:$PATH"'
+}
+
+build_python_package() {
+    echo "🧪 Developer build mode..."
+    export PACKAGE_VERSION
+
+    # Clean setuptools wheel staging dirs to avoid rerun collisions like:
+    # "File exists ... neat_insight-<ver>.dist-info"
+    find "$BUILD_DIR" -maxdepth 1 -type d \( -name 'bdist.*' -o -name 'lib.*' \) -exec rm -rf {} +
+    rm -rf neat_insight.egg-info
+
+    if ! python3 -m pip show setuptools > /dev/null 2>&1 || ! python3 -m pip show wheel > /dev/null 2>&1; then
+        echo "📦 Installing Python build tools: setuptools wheel"
+        python3 -m pip install --upgrade setuptools wheel
+    fi
+
+    if [[ -z "$WHEEL_PLAT_NAME" ]]; then
+        echo "❌ Wheel platform tag is not set."
+        exit 1
+    fi
+
+    echo "🐍 Building platform wheel: $WHEEL_PLAT_NAME"
+    PACKAGE_VERSION="$PACKAGE_VERSION" \
+    python3 -m pip wheel \
+        --no-deps \
+        --no-build-isolation \
+        --wheel-dir "$DIST_DIR" \
+        --config-settings=--build-option=--plat-name="$WHEEL_PLAT_NAME" \
+        .
+}
+
+# ==== Start Build ====
+export PATH="$HOME/.local/go/bin:$PATH"
+resolve_package_version
+build_frontend
+ensure_go
+
+if [[ "$TARGET_PLATFORM" == "all" && "$INSTALL_WHEEL" == "1" ]]; then
+    echo "❌ --install cannot be used with --target-platform all."
+    echo "   Build all wheels first, then install a specific one manually."
+    exit 1
+fi
+
+mkdir -p "$BUILD_DIR"
+rm -rf "$GO_TEMP_DIR"
+mkdir -p "$GO_TEMP_DIR"
+
+# ==== Prepare Go build temp module ====
+cp webrtc/*.go "$GO_TEMP_DIR/"
+pushd "$GO_TEMP_DIR" > /dev/null
+go mod init viewer
+go mod tidy
+
+# ==== Detect Platform and Build Go App ====
+OS=$(uname -s)
+ARCH=$(uname -m)
+TARGET=""
+GOOS=""
+GOARCH=""
+PLATFORM=""
+TARGETS_TO_BUILD=()
+
+resolve_target_from_host() {
+    if command -v is_palette >/dev/null 2>&1 && is_palette; then
+        echo "linux-aarch64"
+        return
+    fi
+
+    if [[ "$OS" == "Linux" && "$ARCH" == "aarch64" ]]; then
+        echo "linux-aarch64"
+    elif [[ "$OS" == "Linux" && "$ARCH" == "x86_64" ]]; then
+        echo "linux-amd64"
+    elif [[ "$OS" == "Darwin" ]]; then
+        echo "macos-arm64"
+    elif [[ "$OS" == "Windows_NT" || "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then
+        echo "windows-amd64"
+    else
+        echo "unsupported"
+    fi
+}
+
+if [[ "$TARGET_PLATFORM" == "host" ]]; then
+    TARGET_PLATFORM="$(resolve_target_from_host)"
+fi
+
+case "$TARGET_PLATFORM" in
+    all)
+    TARGETS_TO_BUILD=("linux-aarch64" "linux-amd64" "macos-arm64" "windows-amd64")
+    ;;
+    linux-aarch64|linux-amd64|macos-arm64|windows-amd64)
+    TARGETS_TO_BUILD=("$TARGET_PLATFORM")
+    ;;
+    *)
+    echo "❌ Unsupported target platform: $TARGET_PLATFORM"
+    usage
+    exit 1
+    ;;
+esac
+
+popd > /dev/null
+
+for target in "${TARGETS_TO_BUILD[@]}"; do
+    SHIM_CC_CANDIDATES=()
+    SHIM_CC_PACKAGE=""
+    SHIM_ELF_MACHINE=""
+    VF_BIN_NAME="vf"
+    MTX_BIN_NAME="mediamtx"
+    MTX_ARCHIVE_EXT="tar.gz"
+    case "$target" in
+        linux-aarch64)
+        GOOS="linux"
+        GOARCH="arm64"
+        PLATFORM="linux_arm64"
+        TARGET="mediamtx_v${MTX_VERSION}_${PLATFORM}"
+        WHEEL_PLAT_NAME="manylinux2014_aarch64"
+        SHIM_CC_CANDIDATES=("aarch64-linux-gnu-gcc")
+        [[ "$ARCH" == "aarch64" ]] && SHIM_CC_CANDIDATES=("gcc" "aarch64-linux-gnu-gcc")
+        SHIM_CC_PACKAGE="gcc-aarch64-linux-gnu"
+        SHIM_ELF_MACHINE="AArch64"
+        ;;
+
+        linux-amd64)
+        GOOS="linux"
+        GOARCH="amd64"
+        PLATFORM="linux_amd64"
+        TARGET="mediamtx_v${MTX_VERSION}_${PLATFORM}"
+        WHEEL_PLAT_NAME="manylinux2014_x86_64"
+        SHIM_CC_CANDIDATES=("x86_64-linux-gnu-gcc")
+        [[ "$ARCH" == "x86_64" ]] && SHIM_CC_CANDIDATES=("gcc" "x86_64-linux-gnu-gcc")
+        SHIM_CC_PACKAGE="gcc-x86-64-linux-gnu"
+        SHIM_ELF_MACHINE="Advanced Micro Devices X86-64"
+        ;;
+
+        macos-arm64)
+        GOOS="darwin"
+        GOARCH="arm64"
+        PLATFORM="darwin_arm64"
+        TARGET="mediamtx_v${MTX_VERSION}_${PLATFORM}"
+        WHEEL_PLAT_NAME="macosx_11_0_arm64"
+        ;;
+
+        windows-amd64)
+        GOOS="windows"
+        GOARCH="amd64"
+        PLATFORM="windows_amd64"
+        TARGET="mediamtx_v${MTX_VERSION}_${PLATFORM}"
+        WHEEL_PLAT_NAME="win_amd64"
+        VF_BIN_NAME="vf.exe"
+        MTX_BIN_NAME="mediamtx.exe"
+        MTX_ARCHIVE_EXT="zip"
+        ;;
+    esac
+
+    echo "🛠 Building target: $target"
+    pushd "$GO_TEMP_DIR" > /dev/null
+    echo "🧱 Go build target GOOS=$GOOS GOARCH=$GOARCH"
+    GOOS="$GOOS" GOARCH="$GOARCH" CGO_ENABLED=0 go build -o "../$VF_BIN_NAME" .
+    popd > /dev/null
+
+    # ==== Prepare neat_insight/bin ====
+    echo "📂 Preparing neat_insight/bin for $target"
+    rm -rf "$INSIGHT_BIN"
+    mkdir -p "$INSIGHT_BIN"
+
+    # ==== Download and Extract mediamtx ====
+    MTX_ARCHIVE="${TARGET}.${MTX_ARCHIVE_EXT}"
+    MTX_URL="${MTX_BASE_URL}/${MTX_ARCHIVE}"
+    echo "⬇️ Downloading mediamtx: $MTX_URL"
+    curl -L "$MTX_URL" -o "$BUILD_DIR/$MTX_ARCHIVE"
+
+    echo "📦 Extracting $MTX_ARCHIVE"
+    if [[ "$MTX_ARCHIVE_EXT" == "zip" ]]; then
+        unzip -o "$BUILD_DIR/$MTX_ARCHIVE" -d "$BUILD_DIR" > /dev/null
+    else
+        tar -xzf "$BUILD_DIR/$MTX_ARCHIVE" -C "$BUILD_DIR"
+    fi
+    cp "$BUILD_DIR/$MTX_BIN_NAME" "$INSIGHT_BIN/$MTX_BIN_NAME"
+    chmod +x "$INSIGHT_BIN/$MTX_BIN_NAME" || true
+    rm "$BUILD_DIR/$MTX_ARCHIVE"
+
+    # ==== Copy app assets ====
+    cp "$BUILD_DIR/$VF_BIN_NAME" "$INSIGHT_BIN/$VF_BIN_NAME"
+    chmod +x "$INSIGHT_BIN/$VF_BIN_NAME" || true
+    cp -r webrtc/static "$INSIGHT_BIN/"
+    cp webrtc/mediamtx.yml "$INSIGHT_BIN/"
+
+    # ==== TCP_NODELAY preload shim (Linux wheels only) ====
+    # LD_PRELOAD is a Linux mechanism, so macOS and Windows wheels ship without
+    # it and mediasrc falls back to spawning ffmpeg unmodified.
+    if [[ -n "$SHIM_CC_PACKAGE" && "$SKIP_SHIM" == "1" ]]; then
+        echo "⏭️ Skipping TCP_NODELAY shim (--skip-shim); this $target wheel will run ffmpeg with Nagle enabled"
+    elif [[ -n "$SHIM_CC_PACKAGE" ]]; then
+        SHIM_CC=""
+        for candidate in "${SHIM_CC_CANDIDATES[@]}"; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+                SHIM_CC="$candidate"
+                break
+            fi
+        done
+        if [[ -z "$SHIM_CC" ]]; then
+            echo "❌ No C compiler for $target. Install $SHIM_CC_PACKAGE."
+            exit 1
+        fi
+        echo "🧱 Building ffmpeg_nodelay.so with $SHIM_CC"
+        "$SHIM_CC" -shared -fPIC -O2 -o "$INSIGHT_BIN/ffmpeg_nodelay.so" \
+            tools/ffmpeg_nodelay.c
+
+        # The wheel is tagged manylinux2014, which promises glibc 2.17. The
+        # host toolchain will happily emit a newer requirement, so refuse to
+        # package a shim that would fail to preload on an older target.
+        if command -v readelf >/dev/null 2>&1; then
+            ELF_MACHINE=$(readelf -h "$INSIGHT_BIN/ffmpeg_nodelay.so" | sed -n 's/^ *Machine: *//p')
+            if [[ "$ELF_MACHINE" != "$SHIM_ELF_MACHINE" ]]; then
+                echo "❌ ffmpeg_nodelay.so is built for '$ELF_MACHINE', not '$SHIM_ELF_MACHINE' ($target)."
+                exit 1
+            fi
+            MAX_GLIBC=$(readelf -V "$INSIGHT_BIN/ffmpeg_nodelay.so" \
+                | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)
+            if [[ -z "$MAX_GLIBC" ]]; then
+                echo "❌ Could not read glibc symbol versions from ffmpeg_nodelay.so."
+                exit 1
+            fi
+            if [[ "$(printf '%s\n2.17\n' "$MAX_GLIBC" | sort -V | tail -1)" != "2.17" ]]; then
+                echo "❌ ffmpeg_nodelay.so requires glibc $MAX_GLIBC, above the manylinux2014 baseline of 2.17."
+                exit 1
+            fi
+            echo "✅ ffmpeg_nodelay.so: $ELF_MACHINE, glibc <= 2.17"
+        else
+            echo "❌ readelf is required to validate the Linux shim; install binutils."
+            exit 1
+        fi
+    fi
+
+    # Bundle built React frontend into the Python package for wheel installs.
+    if [[ -d "frontend/dist" ]]; then
+        echo "📦 Bundling frontend/dist into neat_insight/frontend_dist"
+        rm -rf neat_insight/frontend_dist
+        mkdir -p neat_insight/frontend_dist
+        cp -r frontend/dist/. neat_insight/frontend_dist/
+    else
+        echo "⚠️ frontend/dist not found. UI will not be bundled into wheel."
+    fi
+
+    # ==== Python Packaging ====
+    echo "🐍 Building Python wheel for $target ($WHEEL_PLAT_NAME)"
+    build_python_package
+done
+
+install_wheel_into_venv
+echo "✅ Build complete. Wheel artifacts are in: $DIST_DIR/"

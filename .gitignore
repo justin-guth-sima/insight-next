@@ -1,0 +1,26 @@
+__pycache__
+mediamtx
+vf
+go.mod
+go.sum
+.venv
+build/
+dist/
+neat_insight.egg-info/
+neat_insight/bin/
+neat_insight/tools/mediadata_sender
+frontend/node_modules/
+frontend/dist/
+front_dist/
+neat_insight/frontend_dist/
+*.pem
+cfg.json
+.vscode/
+*_mpk.tar.gz
+mipi-sweep-*.log
+folder-navigation-insight.log
+mipi-util/vendor/
+
+# Superpowers brainstorming sessions
+.superpowers/
+docs/superpowers/

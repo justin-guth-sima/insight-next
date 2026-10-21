@@ -1,0 +1,261 @@
+import argparse
+import json
+import random
+import socket
+import threading
+import time
+
+_last_shape_update = 0.0
+_cached_segments = []
+_track_positions = {}
+
+DEFAULT_FPS = 30.0
+FRAME_WIDTH = 1280
+FRAME_HEIGHT = 720
+
+
+def generate_object_detection():
+    detections = [
+        ("obj_1", "car", [100, 100, 100, 80], (0.7, 0.99)),
+        ("obj_2", "person", [1020, 100, 60, 120], (0.85, 0.99)),
+        ("obj_3", "bicycle", [100, 540, 90, 70], (0.6, 0.95)),
+        ("obj_4", "dog", [1020, 540, 70, 60], (0.6, 0.95)),
+    ]
+    return {
+        "type": "object-detection",
+        "timestamp": time.time(),
+        "data": {
+            "objects": [
+                {
+                    "id": object_id,
+                    "label": label,
+                    "confidence": round(random.uniform(*confidence_range), 2),
+                    "bbox": [bbox[0] + random.randint(-6, 6), bbox[1] + random.randint(-6, 6), bbox[2], bbox[3]],
+                }
+                for object_id, label, bbox, confidence_range in detections
+            ]
+        },
+    }
+
+
+def generate_classification():
+    classes = ["urban", "nature", "indoor", "beach", "mountain"]
+    return {
+        "type": "classification",
+        "timestamp": time.time(),
+        "data": {
+            "top_classes": [
+                {"label": label, "confidence": round(random.uniform(0.3, 1.0), 2)}
+                for label in random.sample(classes, 3)
+            ]
+        },
+    }
+
+
+POSE_TEMPLATE = {
+    "nose": (0, 0),
+    "left_eye": (-10, -10),
+    "right_eye": (10, -10),
+    "left_shoulder": (-20, 50),
+    "right_shoulder": (20, 50),
+    "left_hip": (-15, 130),
+    "right_hip": (15, 130),
+}
+
+POSE_ORIGINS = [("pose_1", 240, 180), ("pose_2", 640, 200), ("pose_3", 1040, 180)]
+
+
+def generate_pose_estimation():
+    poses = []
+    for pose_id, origin_x, origin_y in POSE_ORIGINS:
+        jitter_x = random.randint(-6, 6)
+        jitter_y = random.randint(-6, 6)
+        poses.append(
+            {
+                "id": pose_id,
+                "label": "person",
+                "keypoints": [
+                    {
+                        "name": name,
+                        "x": origin_x + dx + jitter_x,
+                        "y": origin_y + dy + jitter_y,
+                        "confidence": round(random.uniform(0.85, 1.0), 2),
+                    }
+                    for name, (dx, dy) in POSE_TEMPLATE.items()
+                ],
+            }
+        )
+    return {"type": "pose-estimation", "timestamp": time.time(), "data": {"poses": poses}}
+
+
+def _ellipse_rle(mask_h, mask_w):
+    """Encode an ellipse filling a bbox-local mask as alternating run lengths.
+
+    Runs walk the mask column-major and the first run is background, which is the
+    encoding the viewer decodes. The mask is bbox-local, so one mask at mask-head
+    resolution is valid for every bounding box.
+    """
+    counts = []
+    previous = 0
+    run = 0
+    for x in range(mask_w):
+        for y in range(mask_h):
+            nx = (x + 0.5) / mask_w * 2 - 1
+            ny = (y + 0.5) / mask_h * 2 - 1
+            value = 1 if nx * nx + ny * ny <= 1.0 else 0
+            if value == previous:
+                run += 1
+            else:
+                counts.append(run)
+                previous = value
+                run = 1
+    counts.append(run)
+    return {"size": [mask_h, mask_w], "counts": counts}
+
+
+RLE_MASK = _ellipse_rle(mask_h=60, mask_w=40)
+
+
+def _generate_segments():
+    segments = []
+    labels = ["person", "car", "truck"]
+    for index in range(random.randint(3, 4)):
+        w = random.randint(120, 320)
+        h = random.randint(120, 320)
+        x = random.randint(0, FRAME_WIDTH - w)
+        y = random.randint(0, FRAME_HEIGHT - h)
+        segment = {
+            "id": f"seg_{index + 1}",
+            "label": random.choice(labels),
+            "confidence": round(random.uniform(0.55, 0.98), 2),
+            "bbox": [x, y, w, h],
+        }
+        if index % 2 == 0:
+            segment["mask_format"] = "polygon"
+            segment["mask"] = [[x + w // 2, y], [x + w, y + h], [x, y + h]]
+        else:
+            segment["mask_format"] = "rle"
+            segment["mask"] = RLE_MASK
+        segments.append(segment)
+    return segments
+
+
+def generate_segmentation():
+    global _last_shape_update, _cached_segments
+    now = time.time()
+    if now - _last_shape_update > 2.0:
+        _cached_segments = _generate_segments()
+        _last_shape_update = now
+    return {"type": "segmentation", "timestamp": now, "data": {"segments": _cached_segments}}
+
+
+def generate_tracking():
+    now = time.time()
+    tracks = []
+    for track_id, label, start_x, start_y in [
+        ("1", "person", 180, 140),
+        ("2", "person", 760, 420),
+        ("3", "forklift", 980, 180),
+    ]:
+        x, y = _track_positions.get(track_id, (start_x, start_y))
+        dx = random.randint(-18, 18)
+        dy = random.randint(-12, 12)
+        x = min(max(20, x + dx), FRAME_WIDTH - 100)
+        y = min(max(20, y + dy), FRAME_HEIGHT - 140)
+        _track_positions[track_id] = (x, y)
+        tracks.append(
+            {
+                "id": track_id,
+                "label": label,
+                "confidence": round(random.uniform(0.82, 0.99), 2),
+                "bbox": [x, y, 80, 130],
+            }
+        )
+    return {"type": "tracking", "timestamp": now, "data": {"tracks": tracks}}
+
+
+GENERATOR_MAP = {
+    "object-detection": generate_object_detection,
+    "classification": generate_classification,
+    "pose-estimation": generate_pose_estimation,
+    "segmentation": generate_segmentation,
+    "tracking": generate_tracking,
+}
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Send random simulated metadata to vf metadata UDP ports.")
+    parser.add_argument("--host", default="127.0.0.1", help="Destination host (default: 127.0.0.1)")
+    parser.add_argument("--start-port", type=int, default=9100, help="Starting UDP port (default: 9100)")
+    parser.add_argument("--count", type=int, default=1, help="Number of parallel channels (default: 1)")
+    parser.add_argument(
+        "--types",
+        default="object-detection",
+        help="Comma-separated metadata types: object-detection, classification, pose-estimation, segmentation, tracking",
+    )
+    parser.add_argument("--fps", type=float, default=DEFAULT_FPS, help="Messages per second per channel (default: 30)")
+    parser.add_argument("--seed", type=int, default=None, help="Optional RNG seed for repeatable output")
+    parser.add_argument("--verbose", action="store_true", help="Print each emitted payload")
+    return parser.parse_args(argv)
+
+
+def resolve_enabled_types(types_value):
+    return [name.strip() for name in types_value.split(",") if name.strip() in GENERATOR_MAP]
+
+
+def metadata_sender(host, port, channel_id, enabled_types, frame_interval_sec, verbose):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        while True:
+            start_time = time.perf_counter()
+            type_choice = random.choice(enabled_types)
+            payload = GENERATOR_MAP[type_choice]()
+            message = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            sock.sendto(message, (host, port))
+            if verbose:
+                print(f"channel={channel_id} type={type_choice} dst={host}:{port} payload={message.decode('utf-8')}")
+            elapsed = time.perf_counter() - start_time
+            time.sleep(max(0.0, frame_interval_sec - elapsed))
+    finally:
+        sock.close()
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.count < 1:
+        raise SystemExit("--count must be >= 1")
+    if args.fps <= 0:
+        raise SystemExit("--fps must be > 0")
+
+    if args.seed is not None:
+        random.seed(args.seed)
+
+    enabled_types = resolve_enabled_types(args.types)
+    if not enabled_types:
+        raise SystemExit("No valid metadata types specified")
+
+    end_port = args.start_port + args.count - 1
+    print(f"Starting {args.count} metadata sender threads to {args.host}:{args.start_port}-{end_port} at {args.fps:g} FPS")
+    print(f"Enabled metadata types: {', '.join(enabled_types)}")
+
+    frame_interval_sec = 1.0 / args.fps
+    threads = []
+    try:
+        for channel_id in range(args.count):
+            port = args.start_port + channel_id
+            thread = threading.Thread(
+                target=metadata_sender,
+                args=(args.host, port, channel_id, enabled_types, frame_interval_sec, args.verbose),
+                daemon=True,
+            )
+            thread.start()
+            threads.append(thread)
+
+        while True:
+            time.sleep(10)
+    except KeyboardInterrupt:
+        print("Stopped metadata sender.")
+
+
+if __name__ == "__main__":
+    main()

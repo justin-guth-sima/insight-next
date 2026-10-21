@@ -1,0 +1,159 @@
+---
+title: Common Workflows
+description: Use Insight to validate single-stream apps, multi-stream apps, and missing video or metadata.
+sidebar_position: 4
+---
+
+# Common Workflows
+
+## Import standard test videos {#import-standard-test-videos}
+
+Use the standard video sets when you need repeatable media for examples, smoke tests, or multi-stream validation:
+
+```text
+https://artifacts.sima-neat.com/assets/videos/720p16/video01.mp4
+...
+https://artifacts.sima-neat.com/assets/videos/720p16/video16.mp4
+
+https://artifacts.sima-neat.com/assets/videos/480p30/video01.mp4
+...
+https://artifacts.sima-neat.com/assets/videos/480p30/video16.mp4
+```
+
+For manual use, download the files you need and upload them from Media Sources.
+
+For API-driven setup, check whether Insight already has media files:
+
+```bash
+curl -k https://127.0.0.1:9900/api/media-files
+```
+
+If the media library is empty, download and upload a standard video:
+
+```bash
+tmpdir="$(mktemp -d)"
+curl -fL "https://artifacts.sima-neat.com/assets/videos/480p30/video01.mp4" \
+  -o "${tmpdir}/video01.mp4"
+curl -k -F "file=@${tmpdir}/video01.mp4" \
+  https://127.0.0.1:9900/api/upload/media
+```
+
+Repeat this for additional files, or upload an archive when you want to seed a larger media set.
+
+## Validate a single-stream vision app
+
+1. Open Insight.
+2. Go to Media Sources and upload a short test video.
+3. Go to Streaming Sources and assign the video to `src1`.
+4. Start `src1`.
+5. Run your application with the correct RTSP URL:
+   - Inside the SDK container: `rtsp://127.0.0.1:8554/src1`
+   - On a DevKit or external machine: `rtsp://<sdk-host-ip>:<rtsp.tcp hostPortStart>/src1`
+6. Open Video Viewer and watch channel `0`.
+7. If your app sends metadata, confirm overlays appear on the video.
+8. Use the Stats placeholder to see where system load diagnostics will appear in the next release.
+
+## Validate an app against a live webcam
+
+Use this workflow to test an application against a real camera instead of a recorded file. The webcam is attached to the computer running your browser, not to the board: the browser publishes it to Insight, which serves it as an ordinary RTSP source your application consumes exactly like a file.
+
+1. Open Insight over HTTPS and confirm the browser trusts its certificate.
+2. Go to Streaming Sources, select the file field of `src1`, and switch the **Source for src1** dialog to **Camera**.
+3. Select **Enable camera access** and allow access when the browser asks, then pick your camera and **Assign** it. The row shows a `[CAM]` marker once the camera is assigned.
+4. Start `src1` and confirm the slot reports `Live` and the preview shows the camera.
+5. Run your application against the same RTSP URL a file source would use. Insight normalizes the webcam to the same baseline H.264 with regular keyframes a file source produces, so the board's hardware decoder and GStreamer `rtspsrc` consume it with no extra step — no manual `ffmpeg` and no separate path:
+   - Inside the SDK container: `rtsp://127.0.0.1:8554/src1`
+   - On a DevKit or external machine: `rtsp://<sdk-host-ip>:<rtsp.tcp hostPortStart>/src1`
+6. Open Video Viewer and watch channel `0`.
+
+Keep the browser tab visible and in the foreground while the webcam is publishing: the tab is what sends video to Insight, and browsers throttle a hidden or backgrounded tab, which interrupts the stream. Closing the tab, unplugging the camera, or selecting **Stop** ends the stream.
+
+When Insight runs inside the SDK, the browser also needs to reach the `webrtcWhip` host port from `neat --json`, in addition to the RTSP port your application uses. See [Ports and Network Behavior](ports-network.md).
+
+## Validate multiple input streams
+
+1. Upload or prepare multiple videos in Media Sources.
+2. Use Streaming Sources `Auto Assign` to map videos to source slots.
+3. Use `Bulk Start` to start the number of sources your application expects.
+4. Run the application against the corresponding `srcN` stream URLs.
+5. Open Video Viewer with the expected channel set.
+6. Use viewer diagnostics to check for stream bottlenecks. The Stats view is a placeholder in this release and is planned to add runtime bottleneck diagnostics in the next release.
+
+When the application runs outside the SDK container, resolve the RTSP, video UDP, and metadata UDP host ports from `neat --json` before launching the test.
+
+## Stream from an external tool
+
+1. Open Streaming Sources and pick a slot that shows Idle.
+2. Publish to it from the host, e.g. `ffmpeg -f v4l2 -i /dev/video0 -c:v libx264 -preset veryfast -tune zerolatency -g 30 -pix_fmt yuv420p -f rtsp -rtsp_transport tcp rtsp://<insight-host>:8554/src2`.
+3. The slot turns External. Select it and turn the preview on to check the picture; the first frame appears at the publisher's next keyframe, so keep the keyframe interval short (`-g 30` above).
+4. Run the application against the slot's RTSP URL as with any other source.
+5. To reuse the slot for a file, stop the external tool or press Take over.
+
+`sima-ai/tool-mediasources` (`mediasrc.sh`) starts its own MediaMTX on the same RTSP port and numbers streams from `src0`; run it on a different port or use Insight's slots instead of running both.
+
+## Pull an IP camera into a slot
+
+1. Open Streaming Sources and click the file button of a slot that shows Idle.
+2. Switch the dialog to **Stream URL**, enter the camera's RTSP URL (for example `rtsp://192.168.1.10:554/h264Preview_01_main`) and its username and password, then press **Pull**.
+3. The slot shows Connecting…, then Pulled with the codec, resolution and frame rate. Unreachable means the camera did not answer (Insight keeps retrying). If the camera rejects the username or password when you press Pull, the dialog shows the message and the slot is unchanged; Auth failed on the row means the camera started rejecting them later (for example after being unreachable at first): press Stop and pull again.
+4. Run the application against the slot's RTSP URL as with any other source. Only H.264, H.265 and MJPEG cameras can be decoded by Neat pipelines; the codec cell turns amber otherwise.
+5. Press Stop on the row to release the slot.
+
+## Configure application endpoints from the SDK port map
+
+Use this workflow when the application runs on a DevKit and Insight runs inside the SDK:
+
+1. In the SDK, check that Insight is running:
+
+   ```bash
+   insight-admin status
+   ```
+
+2. Get the SDK port map:
+
+   ```bash
+   neat --json
+   ```
+
+3. Find the SDK host IP from `insight.webUiUrl`, or use the host IP printed by the SDK setup flow.
+4. Find `rtsp.tcp.hostPortStart`, `videoUDP.hostPortStart`, and `metadataUDP.hostPortStart` in `exposedPorts`.
+5. Configure application input streams with:
+
+   ```text
+   rtsp://<sdk-host-ip>:<rtsp.tcp hostPortStart>/src1
+   rtsp://<sdk-host-ip>:<rtsp.tcp hostPortStart>/src2
+   ```
+
+6. Configure application output ports by channel:
+
+   ```text
+   video channel N:    <sdk-host-ip>:<videoUDP hostPortStart + N>
+   metadata channel N: <sdk-host-ip>:<metadataUDP hostPortStart + N>
+   ```
+
+7. Start the application and open Video Viewer.
+8. Use `/api/ingest/stats` if the viewer does not show video. It reports whether RTP and metadata are reaching Insight before you debug browser or WebRTC behavior.
+
+## Debug missing video or overlays
+
+Use this sequence to isolate the issue:
+
+1. Confirm the application is running and targeting the correct Insight host.
+2. Confirm whether the application is running inside the SDK container or on an external machine.
+3. If it is external, confirm it uses the mapped `videoUDP` and `metadataUDP` host ports from `neat --json`.
+4. If it is inside the SDK container, confirm the output video port is in `9000-9079`.
+5. Confirm the metadata port, if used, is the matching channel in the metadata UDP range.
+6. Open Video Viewer and check the expected channel.
+7. Use system information to confirm whether Insight is using default ports or SDK-mapped ports.
+8. Use System Information and logs to check device state. Stats is currently a placeholder and is planned to cover device load and runtime health in the next release.
+
+If video is visible but overlays are missing, focus on the metadata path. If overlays are delayed or appear out of sync, tune the viewer metadata delay setting.
+
+## Tips
+
+- Use short media clips when you are building a new app loop. They make source setup and repeated validation faster.
+- Use HTTP MJPEG sources when you need to simulate a camera that exposes multipart MJPEG over HTTP.
+- Keep channel numbering consistent: if video goes to channel `N`, send metadata to the metadata port for the same `N`.
+- Use the Workspace view to inspect generated model and profiling artifacts before copying files out of the environment.
+- Use the Quick Tour in the top-right corner of the Insight UI when you are introducing a new developer to the tool.
+- Use System Information before assuming a port is wrong. In SDK deployments, the browser-facing port may be different from the internal service port.
